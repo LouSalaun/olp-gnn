@@ -21,7 +21,7 @@ def sinr_from_A(A, rho_d):
 # SOCP problem solver
 # (G_dague, P_G, rho_d) set the problem's constraints
 # t: is the currently computed lower bound sinr
-def opti_OLP(t, solver, G_dague, P_G, rho_d, M, K):
+def opti_OLP(t, solver, G_dague, P_G, rho_d, M, K, mask=None):
     A = cp.Variable(shape=(K, K), complex=True)
     A_diag = cp.Variable(shape=(K, 1), pos=True)
     A_tilde = cp.Variable(shape=(K, K+1), complex=True)
@@ -43,6 +43,13 @@ def opti_OLP(t, solver, G_dague, P_G, rho_d, M, K):
 
     Delta = G_dague @ A + P_G @ U
 
+    # mask the unconnected channels
+    if mask is not None:
+        for m in range(M):
+            for k in range(K):
+                if not mask[m, k]:
+                    constraints += [Delta[m, k] == 0]
+
     for m in range(M):
         constraints += [cp.pnorm(Delta[m, :], 2) <= 1]
     obj = cp.Minimize(0)
@@ -55,7 +62,7 @@ def opti_OLP(t, solver, G_dague, P_G, rho_d, M, K):
 # Function solving the B-SOCP by performing bisection search on top
 # of opti_OLP (SOCP) calls
 def OLP_solver(low, up, eps, solver, channel_gen, M, K, papi_events,
-               feas_sinr_tol, feas_power_tol):
+               feas_sinr_tol, feas_power_tol, mask=None):
     start_time = time.process_time()
     if papi_events is not None:
         papi_high.start_counters(papi_events)
@@ -77,7 +84,7 @@ def OLP_solver(low, up, eps, solver, channel_gen, M, K, papi_events,
         tSINR = (lowb+upb) / 2
         try:
             prob, A_test, U_test = opti_OLP(
-                tSINR, solver, G_dague, P_G, rho_d, M, K)
+                tSINR, solver, G_dague, P_G, rho_d, M, K, mask)
             is_feasible = False
             if prob.value is not None and prob.value < np.inf:
                 # the problem is feasible according to the solver
@@ -103,6 +110,9 @@ def OLP_solver(low, up, eps, solver, channel_gen, M, K, papi_events,
             upb = tSINR
 
     Delta_opt = G_dague @ A_opt + P_G @ U_opt
+    if mask is not None:
+        Delta_opt = np.multiply(Delta_opt, mask)
+
     if papi_events is not None:
         flops = papi_high.stop_counters()
     else:
@@ -116,20 +126,27 @@ def OLP_solver(low, up, eps, solver, channel_gen, M, K, papi_events,
 # The solver used here is MOSEK
 # channel_gen: generates the channel matrix given M and K
 # papi_events: is passed to count the FLOPs of the solver
-def data_generation_olp(n, channel_gen, M, K, papi_events=None, verbose=True):
+def data_generation_olp(n, channel_gen, M, K, papi_events=None, verbose=True,
+                        mask_gen=None):
     Delta = []
     SINR = []
     G = []
     flops = []
     A = []
     U = []
+    masks = []
     low, up = 0, 10**6
     eps = 0.01
     feas_sinr_tol, feas_power_tol = 1e-3, 1e-6
 
     for i in range(n):
+        if mask_gen is not None:
+            mask = mask_gen(M, K)
+            masks.append(mask)
+        else:
+            mask = None
         sol = OLP_solver(low, up, eps, 'MOSEK', channel_gen, M, K, papi_events,
-                         feas_sinr_tol, feas_power_tol)
+                         feas_sinr_tol, feas_power_tol, mask)
         cur_SINR = 10*log10(sol[0])  # from linear to dB
         SINR.append(cur_SINR)
         Delta.append(sol[1])
@@ -144,4 +161,6 @@ def data_generation_olp(n, channel_gen, M, K, papi_events=None, verbose=True):
 
     out_dict = {'SINR': SINR, 'Delta': Delta, 'G': G, 'flops': flops,
                 'A': A, 'U': U}
+    if mask_gen is not None:
+        out_dict['mask'] = masks
     return out_dict
